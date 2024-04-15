@@ -28,6 +28,7 @@ SCRIPT_DESC = 'Send and receive messages via Signal with weechat'
 
 SCRIPT_COMMAND = 'signal'
 SCRIPT_BUFFER = 'signal'
+ATTACHMENT_DIR = "/home/robin/.local/share/signal-cli/attachments"
 
 useragent = "%s v%s by %s" % (SCRIPT_NAME, SCRIPT_VERSION, SCRIPT_AUTHOR)
 
@@ -35,13 +36,8 @@ active_line = None
 highlight = weechat.color("_bold")
 own_uuid = None
 
-def get_groupinfo(dictionary):
-    groupInfo = None
-    if 'group' in dictionary.keys():
-        groupInfo = dictionary['group']
-    elif 'groupV2' in dictionary.keys():
-        groupInfo = dictionary['groupV2']
-    return groupInfo
+def get_groupinfo(datamessage):
+    return datamessage.get('groupInfo')
 
 
 def get_groupid(groupinfo):
@@ -65,7 +61,7 @@ def get_logfile():
     return os.path.join(os.path.expanduser(weechat_dir), "logs", "signal.log")
 
 default_options = {
-    "socket": "/var/run/signald/signald.sock",
+    "socket": "/run/user/1000/signal-cli/socket",
     "loglevel": "WARN",
     "sentry_dsn": "",
     "number": ""
@@ -175,32 +171,22 @@ def receive(data, fd):
     logger.debug("Got message from signald: %s", data)
     payload = json.loads(data.encode('latin1'))
     signald_callbacks = {
-        "version": handle_version,
-        "IncomingMessage": message_cb,
-        "list_contacts": contact_list_cb,
-        "list_groups": group_list_cb,
-        "send_results": noop_cb,
-        "sync_requested": noop_cb,
-        "listen_started": noop_cb,
-        "listen_stopped": noop_cb,
-        "account_refreshed": noop_cb,
-        "ListenerState": noop_cb,
+        "listContacts": noop_cb,
+        "listGroups": noop_cb,
         "send": noop_cb,
-        "request_sync": noop_cb,
-        "ExceptionWrapper": noop_cb,
-        "WebSocketConnectionState": noop_cb,
-        "get_profile": noop_cb,
+        "receive": handle_receive_cb,
+        "result": noop_cb,
     }
 
     try:
         if "id" in payload and payload["id"] in callbacks:
             callback = callbacks.pop(payload["id"])
             callback["func"](payload, *callback["args"], **callback["kwargs"])
-        elif payload.get('type') in signald_callbacks:
-            signald_callbacks[payload.get('type')](payload.get('data'))
+        elif payload.get('method') in signald_callbacks:
+            signald_callbacks[payload.get('method')](payload.get('params'))
         else:
-            prnt("Got unhandled {} message from signald, see debug log for more info".format(payload.get('type')))
-            logger.warning("Got unhandled message of type %s from signald", payload.get('type'))
+            prnt("Got unhandled {} message from signald, see debug log for more info".format(payload.get('method')))
+            logger.warning("Got unhandled message of method %s from signald", payload.get('method'))
     except:
         logger.exception("exception while handling payload %s", json.dumps(payload, indent="    "))
     return weechat.WEECHAT_RC_OK
@@ -208,11 +194,15 @@ def receive(data, fd):
 
 def send(msgtype, cb=None, cb_args=[], cb_kwargs={}, **kwargs):
     global signald_socket
-    request_id = kwargs.get("request_id", get_request_id())
-    payload = kwargs
-    payload['type'] = msgtype
+    if "id" in kwargs:
+        request_id = kwargs.pop("id")
+    else:
+        request_id = get_request_id()
+    payload = {}
+    payload['params'] = kwargs
+    payload['method'] = msgtype
     payload["id"] = request_id
-    payload["version"] = "v1"
+    payload["jsonrpc"] = "2.0"
     if cb is not None:
         callbacks[request_id] = {"func": cb, "args": cb_args, "kwargs": cb_kwargs}
     msg = json.dumps(payload)
@@ -222,18 +212,27 @@ def send(msgtype, cb=None, cb_args=[], cb_kwargs={}, **kwargs):
     except (BrokenPipeError, OSError):
         close_socket()
         init_socket()
+    except Exception as e:
+        prnt("could not send message:")
+        prnt(e)
 
 
-def subscribe(number):
-    send("request_sync", account=number)
-    send("list_contacts", account=number)
-    send("list_groups", account=number)
-    send("get_profile", account=number, address={"number": number}, cb=set_uuid)
-    send("subscribe", account=number, cb=subscribe_cb, cb_kwargs={"number": number})
+def subscribe():
+#     send("request_sync", account=number)
+    send("listContacts", cb=list_contacts_cb)
+    send("listGroups", cb=list_groups_cb)
+    send("send", message="subscribe", noteToSelf=True, cb=set_uuid)
+#     send("subscribe", account=number, cb=subscribe_cb, cb_kwargs={"number": number})
+# 
+# 
+# def subscribe_cb(payload, number):
+#     prnt("Successfully subscribed to {}".format(number))
 
-
-def subscribe_cb(payload, number):
-    prnt("Successfully subscribed to {}".format(number))
+def handle_receive_cb(params):
+    envelope = params.get('envelope')
+    if envelope is not None:
+        if 'dataMessage' in envelope:
+            message_cb(envelope)
 
 def render_message(message):
     sticker = message.get('sticker')
@@ -247,16 +246,16 @@ def render_message(message):
             em = emoji.demojize(em)
         return "<reacted with {} to a message from {}>".format(em, name)
     attachment_msg = ""
-    attachments = message.get('attachments')
+    attachments = message.get('attachments', None)
     if attachments is not None:
         types = [attach['contentType'] for attach in attachments]
-        filenames = [attach['storedFilename'] for attach in attachments]
+        filenames = [os.path.join(ATTACHMENT_DIR, attach['id']) for attach in attachments]
         attachment_msg = "<sent {}>: \n{}\n\n".format(
                 ', '.join(types),
                 '\n'.join(filenames))
 
-    quote = message.get('quote')
     quote_msg = ""
+    quote = message.get('quote', None)
     if quote is not None:
         quote_msg = quote['text']
         if quote_msg != "":
@@ -267,7 +266,8 @@ def render_message(message):
             )
             quote_msg = wrapper.fill(weechat.string_remove_color(quote_msg, "")) + "\n"
 
-    body = message.get('body', "")
+    body = message.get('message', "")
+    body = "" if body == None else body
     mentions = message.get('mentions', [])
     for mention in mentions[::-1]:
         mentioned = contact_name(mention["uuid"])
@@ -287,64 +287,78 @@ def render_message(message):
     else:
         return message_string
 
-def message_cb(payload):
-    if payload.get('data_message') is not None:
-        message = render_message(payload['data_message'])
-        timestamp = get_timestamp(payload)
-        author = get_author(payload)
+def message_cb(envelope):
+    if envelope.get('dataMessage') is not None:
+        message = render_message(envelope['dataMessage'])
+        timestamp = get_timestamp(envelope)
+        author = get_author(envelope)
         tags = [
             "author_{}".format(author),
             "timestamp_{}".format(timestamp),
         ]
         if message is not None:
-            groupInfo = get_groupinfo(payload['data_message'])
+            groupInfo = get_groupinfo(envelope['dataMessage'])
             group = get_groupid(groupInfo)
-            show_msg(payload['source']['uuid'], group, message, True, tags)
-    elif payload.get('syncMessage') is not None:
-        # some syncMessages are to synchronize read receipts; we ignore these
-        if payload['syncMessage'].get('readMessages') is not None:
-            return
-
-        # if contactsComplete is present, the contact sync from initial plugin
-        # load (or someone else triggering a contacts sync on signald) is
-        # complete, and we should update our contacts list.
-        if payload['syncMessage'].get('contactsComplete', False):
-            send("list_contacts", account=options['number'])
-            return
-
-        # we don't know how to render anything besides sync messags with actual
-        # 'sent' info.
-        if 'sent' not in payload['syncMessage']:
-            return
-
-        message = render_message(payload['syncMessage']['sent']['message'])
-        timestamp = get_timestamp(payload)
-        author = get_author(payload)
-        tags = [
-            "author_{}".format(author),
-            "timestamp_{}".format(timestamp),
-        ]
-        groupInfo = get_groupinfo(payload['syncMessage']['sent']['message'])
-        group = get_groupid(groupInfo)
-        dest = payload['syncMessage']['sent']['destination']['uuid'] if groupInfo is None else None
-        show_msg(dest, group, message, False, tags)
+            show_msg(author, group, message, True, tags)
+#     elif payload.get('syncMessage') is not None:
+#         # some syncMessages are to synchronize read receipts; we ignore these
+#         if payload['syncMessage'].get('readMessages') is not None:
+#             return
+# 
+#         # if contactsComplete is present, the contact sync from initial plugin
+#         # load (or someone else triggering a contacts sync on signald) is
+#         # complete, and we should update our contacts list.
+#         if payload['syncMessage'].get('contactsComplete', False):
+#             send("list_contacts", account=options['number'])
+#             return
+# 
+#         # we don't know how to render anything besides sync messags with actual
+#         # 'sent' info.
+#         if 'sent' not in payload['syncMessage']:
+#             return
+# 
+#         message = render_message(payload['syncMessage']['sent']['message'])
+#         timestamp = get_timestamp(payload)
+#         author = get_author(payload)
+#         tags = [
+#             "author_{}".format(author),
+#             "timestamp_{}".format(timestamp),
+#         ]
+#         groupInfo = get_groupinfo(payload['syncMessage']['sent']['message'])
+#         group = get_groupid(groupInfo)
+#         dest = payload['syncMessage']['sent']['destination']['uuid'] if groupInfo is None else None
+#         show_msg(dest, group, message, False, tags)
 
 
 def noop_cb(payload):
     pass
 
 
-def contact_list_cb(payload):
+def list_contacts_cb(payload):
     global contacts
 
-    for contact in payload['profiles']:
-        uuid = contact['address']['uuid']
+    for contact in payload['result']:
+        uuid = contact['uuid']
         contacts[uuid] = contact
         logger.debug("Checking for buffers with contact %s", contact)
         if uuid in buffers:
             b = buffers[uuid]
             name = contact_name(uuid)
             set_buffer_name(b, name)
+
+    prnt("contacts updated")
+    #for contact in contacts.values():
+    #    prnt("  {}".format(contact['number']))
+
+
+def list_groups_cb(payload):
+    global groups
+    for group in payload.get('result', []):
+        groups[group.get('id')] = group
+
+    prnt("groups updated:")
+    for group in groups.values():
+        prnt("  {}".format(group['name']))
 
 
 def set_buffer_name(b, name):
@@ -354,18 +368,14 @@ def set_buffer_name(b, name):
     weechat.buffer_set(b, "shortname", name)
 
 
-def group_list_cb(payload):
-    global groups
-    for group in payload.get('groups', []):
-        groups[get_groupid(group)] = group
-    for group in payload.get('groupsv2', []):
-        groups[get_groupid(group)] = group
-
-
-
 def setup_group_buffer(groupId):
     global groups
-    group = groups[groupId]
+    if not groupId in groups:
+        send("listGroups", cb=list_groups_cb)
+    group = groups.get(groupId)
+    if group is None:
+        prnt("Cannot open buffer, group {} not found".format(groupId))
+        return
     buffer = get_buffer(groupId, True)
     set_buffer_name(buffer, get_groupname(group))
     weechat.buffer_set(buffer, "nicklist", "1")
@@ -389,6 +399,8 @@ def get_buffer(identifier, isGroup):
         cb = "buffer_input_group" if isGroup else "buffer_input"
         logger.debug("Creating buffer for identifier %s (%s)", identifier, "group" if isGroup else "contact")
         buffers[identifier] = weechat.buffer_new(identifier, cb, identifier, "buffer_close_cb", identifier)
+        if not isGroup and identifier not in contacts:
+            send("listContacts", cb=list_contacts_cb)
         if not isGroup and identifier in contacts:
             name = contact_name(identifier)
             weechat.buffer_set(buffers[identifier], "localvar_set_type", "private")
@@ -404,27 +416,29 @@ def encode_message(message):
         message = emoji.emojize(message, use_aliases=True)
     return message
 
-def send_message(uuid, message, **kwargs):
+def send_message(buffer_uuid, message, **kwargs):
     encoded = encode_message(message)
     request_id = get_request_id()
-    show_msg(uuid, None, message, False)
+    show_msg(buffer_uuid, None, message, False)
     _, message_pointer = get_last_line()
+    params = {
+        "message": encoded,
+    }
+    params.update(**kwargs)
     send(
         "send",
-        username=options["number"],
-        messageBody=encoded,
-        request_id=request_id,
+        id=request_id,
         cb=send_cb,
         cb_args=[message_pointer,],
-        **kwargs
+        **params,
     )
 
 def buffer_input(uuid, buffer, message):
-    send_message(uuid, message, recipientAddress={"uuid": uuid})
+    send_message(uuid, message, recipient=uuid)
     return weechat.WEECHAT_RC_OK
 
 def buffer_input_group(groupId, buffer, message):
-    send_message(groupId, message, recipientGroupId=groupId)
+    send_message(groupId, message, groupId=groupId)
     return weechat.WEECHAT_RC_OK
 
 def close_socket():
@@ -440,6 +454,7 @@ def close_socket():
 def init_socket():
     global signald_socket
     global signald_hook
+    prnt("initializing socket")
     signald_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         signald_socket.connect(options["socket"])
@@ -447,7 +462,10 @@ def init_socket():
         # want it to be bytes. so we end up having to do a bunch of gnarly
         # decoding and stuff in receive(). c'est la vie.
         signald_hook = weechat.hook_fd(signald_socket.fileno(), 1, 0, 0, 'receive', '')
-    except Exception:
+        prnt("socket initialized")
+    except Exception as e:
+        prnt("could not initialize socket:")
+        prnt(e)
         logger.exception("Failed to connect to signald socket")
 
 
@@ -501,16 +519,9 @@ def smsg_cmd_cb(data, buffer, args):
 
 def signal_cmd_cb(data, buffer, args):
     if args == 'list groups':
-        prnt('List of all available Signal groups:')
-        for group in groups:
-            prnt(get_groupname(groups[group]))
-        prnt('')
+        send("listGroups", cb=list_groups_cb)
     elif args == 'list contacts':
-        prnt('List of all available contacts:')
-        for uuid in contacts:
-            if contact_name(uuid) != options['number']:
-                prnt('{name}, {uuid}\n'.format(name=contact_name(uuid), uuid=uuid))
-        prnt('')
+        send("listContacts", cb=list_contacts_cb)
     elif args.startswith('attach'):
         attach_cmd_cb(data, buffer, args.lstrip("attach"))
     elif args.startswith('reply'):
@@ -549,9 +560,9 @@ def attach_cmd_cb(data, buffer, args):
     # determine if it's a group or contact,
     # send files and show confirmation message
     if uuid in groups:
-        send("send", username=options["number"], recipientGroupId=uuid, attachments=files)
+        send("send", GroupId=uuid, attachments=files)
     else:
-        send("send", username=options["number"], recipientAddress={"uuid": uuid}, attachments=files)
+        send("send", recipient=uuid, attachments=files)
 
     msg = "sent file(s):\n{}".format(files)
     show_msg(uuid, None, msg, False)
@@ -567,19 +578,11 @@ def completion_cb(data, completion_item, buffer, completion):
 
     return weechat.WEECHAT_RC_OK
 
-def get_author(payload):
-    source = payload.get('source', None)
-    if source is not None:
-        return source.get('uuid', '')
-    else:
-        return ''
+def get_author(envelope):
+    return envelope.get('sourceUuid')
 
-def get_timestamp(payload):
-    data_message = payload.get('data_message', None)
-    if data_message is not None:
-        return data_message.get('timestamp', '')
-    else:
-        return ''
+def get_timestamp(envelope):
+    return envelope.get('timestamp')
 
 def get_tags(line_data):
     hdata = weechat.hdata_get("line_data")
@@ -680,33 +683,40 @@ def reply_cmd_cb(data, buffer, args):
         return weechat.WEECHAT_RC_ERROR
 
     old_message = weechat.hdata_string(hdata, line_data, "message")
-    if len(old_message) > 20:
-        old_message = old_message[:20] + "..."
     show_msg(uuid, None, "{}> reply to: {}{}".format(
-        weechat.color("green"), old_message, weechat.color("chat")
+        weechat.color("green"), shorten_message(old_message), weechat.color("chat")
     ), False)
 
-    quote = {
-        "id": timestamp,
-        "author": {
-            "uuid": author,
-        }
-    }
+#     quote = {
+#         "id": int(timestamp),
+#         "author": contacts[author]['number'],
+# #         "author": author,
+#         "authorUuid": author,
+#         "authorNumber": contacts[author]['number'],
+#    }
     if uuid in groups:
         send_message(
             uuid,
             args,
-            recipientGroupId=uuid,
-            quote=quote
+            GroupId=uuid,
+            quoteAuthor=author,
+            quoteTimestamp=int(timestamp),
         )
     else:
         send_message(
             uuid,
             args,
-            recipientAddress={"uuid": uuid},
-            quote=quote
+            recipient=uuid,
+            quoteAuthor=author,
+            quoteTimestamp=int(timestamp),
         )
     return weechat.WEECHAT_RC_OK
+
+def shorten_message(message):
+    if len(message) > 20:
+        return message[:20] + "..."
+    else:
+        return message
 
 def get_request_id():
     # returns timestamp in milliseconds, as used by signal
@@ -718,21 +728,22 @@ def set_uuid(payload):
     global own_uuid
     if own_uuid is not None:
         return
-    address = payload['data'].get('address', None)
-    if address is not None:
-        if address.get('number', None) == options["number"]:
-            own_uuid = address.get('uuid', None)
+    results = payload.get('result', {}).get('results')
+    if results is not None and len(results) > 0:
+        recipient = results[0].get('recipientAddress')
+        if recipient is not None:
+            own_uuid = recipient.get('uuid', None)
             prnt("set own_uuid to {}".format(own_uuid))
 
 def send_cb(payload, line_data):
     global own_uuid
     hdata = weechat.hdata_get("line_data")
-    timestamp = payload['data'].get('timestamp', None)
-    if timestamp is None or own_uuid is None:
-        return
+    timestamp = payload.get('result', {}).get('timestamp', None)
     tags = get_tags(line_data)
-    tags.append("author_{}".format(own_uuid))
-    tags.append("timestamp_{}".format(timestamp))
+    if timestamp is not None:
+        tags.append("timestamp_{}".format(timestamp))
+    if own_uuid is not None:
+        tags.append("author_{}".format(own_uuid))
     weechat.hdata_update(hdata, line_data, {"tags_array": ",".join(tags)})
 
 if __name__ == "__main__":
@@ -757,5 +768,6 @@ if __name__ == "__main__":
                                  "\n".join(signal_help), "%(list)", "signal_cmd_cb", "")
             weechat.hook_signal("buffer_switch", "reset_active_line_cb", "")
             init_socket()
+            subscribe()
     except Exception:
         logger.exception("Failed to initialize plugin.")
